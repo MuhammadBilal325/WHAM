@@ -50,20 +50,14 @@ class UdpFrameGrabber:
         self.reopen_fail_read_threshold = 300
 
     def _open_capture(self):
-        if self.input_mode == "webcam":
-            cap = cv2.VideoCapture(int(self.webcam_index))
-            if cap.isOpened():
-                return cap
-            cap.release()
-            return None
-
-        cap = cv2.VideoCapture(self.stream_url, cv2.CAP_FFMPEG)
+        source = self.stream_url if self.input_mode == "udp" else int(self.webcam_index)
+        cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
         if cap.isOpened():
             return cap
 
         # Fallback to default backend if FFmpeg-specific open fails.
         cap.release()
-        cap = cv2.VideoCapture(self.stream_url)
+        cap = cv2.VideoCapture(source)
         if cap.isOpened():
             return cap
 
@@ -80,21 +74,11 @@ class UdpFrameGrabber:
             if cap is not None:
                 self.cap = cap
                 self.failed_reads = 0
-                source_name = (
-                    f"webcam:{self.webcam_index}"
-                    if self.input_mode == "webcam"
-                    else self.stream_url
-                )
-                logger.info(f"Video stream opened ({source_name})")
+                logger.info(f"Input opened (mode={self.input_mode})")
                 return
 
-            source_name = (
-                f"webcam:{self.webcam_index}"
-                if self.input_mode == "webcam"
-                else self.stream_url
-            )
             logger.warning(
-                f"Stream not available yet: {source_name}. Retrying in 2s..."
+                f"Input not available yet (mode={self.input_mode}, source={self.stream_url if self.input_mode == 'udp' else self.webcam_index}). Retrying in 2s..."
             )
             time.sleep(2.0)
 
@@ -173,6 +157,21 @@ class UdpFrameGrabber:
 
         return chunk
 
+    def pop_latest(self, timeout_s=0.5, on_item=None):
+        """Pop the newest available frame, dropping older queued frames."""
+        try:
+            item = self.queue.get(timeout=timeout_s)
+            if on_item is not None:
+                on_item(item)
+        except queue.Empty:
+            return None
+
+        drained = self._drain_queue_nowait(on_item=on_item)
+        if len(drained) > 0:
+            self.frames_skipped_latest += len(drained)
+            item = drained[-1]
+        return item
+
     def wait_for_first_frame(self, poll_interval_s=0.5):
         """Block indefinitely until at least one decoded frame is available."""
         while not self.stop_event.is_set():
@@ -191,33 +190,26 @@ class UdpFrameGrabber:
 
 
 class RealtimeWham:
-    def __init__(self, cfg):
+    def __init__(self, cfg, vitpose_variant='h', vitpose_ckpt=None, min_track_frames=8, min_valid_joints=6):
         self.cfg = cfg
         smpl_batch = self.cfg.TRAIN.BATCH_SIZE * self.cfg.DATASET.SEQLEN
         self.network = build_network(self.cfg, build_body_model(self.cfg.DEVICE, smpl_batch))
         self.network.eval()
-        self.detector = DetectionModel(self.cfg.DEVICE.lower())
+        self.detector = DetectionModel(
+            self.cfg.DEVICE.lower(),
+            vitpose_variant=vitpose_variant,
+            vitpose_ckpt=vitpose_ckpt,
+            minimum_frames=min_track_frames,
+            minimum_joints=min_valid_joints,
+        )
         self.extractor = FeatureExtractor(self.cfg.DEVICE.lower(), self.cfg.FLIP_EVAL)
 
     @torch.no_grad()
-    def run_chunk(self, frames, chunk_video_path, fps):
+    def run_chunk(self, frames, fps):
         if len(frames) == 0:
             return {}, {}, None
 
         height, width = frames[0].shape[:2]
-
-        writer = cv2.VideoWriter(
-            chunk_video_path,
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            fps,
-            (width, height),
-        )
-        if not writer.isOpened():
-            raise RuntimeError(f"Failed to create temporary video: {chunk_video_path}")
-
-        for frame in frames:
-            writer.write(frame)
-        writer.release()
 
         # Reset tracking state while keeping the detection model in memory.
         self.detector.initialize_tracking()
@@ -247,7 +239,7 @@ class RealtimeWham:
         slam_results = np.zeros((length, 7), dtype=np.float32)
         slam_results[:, 3] = 1.0
 
-        tracking_results = self.extractor.run(chunk_video_path, tracking_results)
+        tracking_results = self.extractor.run(frames, tracking_results)
 
         dataset = CustomDataset(self.cfg, tracking_results, slam_results, width, height, fps)
         results = defaultdict(dict)
@@ -287,6 +279,150 @@ class RealtimeWham:
         return results, tracking_results, meta
 
 
+class AsyncLatestProcessor:
+    def __init__(self, engine, cfg, preview_enabled, save_results, output_dir):
+        self.engine = engine
+        self.cfg = cfg
+        self.preview_enabled = preview_enabled
+        self.save_results = save_results
+        self.output_dir = output_dir
+
+        self._job_lock = threading.Lock()
+        self._latest_job = None
+        self._job_event = threading.Event()
+        self._stop_event = threading.Event()
+
+        self._out_lock = threading.Lock()
+        self._latest_overlay = None
+        self._latest_text = None
+        self._latest_chunk_id = -1
+
+        self._renderer = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def submit(self, chunk_id, frames, frame_indices, stream_ts, fps):
+        job = {
+            "chunk_id": chunk_id,
+            "frames": [f.copy() for f in frames],
+            "frame_indices": list(frame_indices),
+            "stream_ts": list(stream_ts),
+            "fps": fps,
+        }
+        with self._job_lock:
+            self._latest_job = job
+            self._job_event.set()
+
+    def get_latest_overlay(self):
+        with self._out_lock:
+            if self._latest_overlay is None:
+                return None, None, -1
+            return self._latest_overlay.copy(), self._latest_text, self._latest_chunk_id
+
+    def stop(self):
+        self._stop_event.set()
+        self._job_event.set()
+        self._thread.join(timeout=2.0)
+
+    def _run(self):
+        while not self._stop_event.is_set():
+            self._job_event.wait(timeout=0.1)
+            if self._stop_event.is_set():
+                break
+            if not self._job_event.is_set():
+                continue
+
+            with self._job_lock:
+                job = self._latest_job
+                self._latest_job = None
+                self._job_event.clear()
+
+            if job is None:
+                continue
+
+            chunk_id = job["chunk_id"]
+            frames = job["frames"]
+            frame_indices = job["frame_indices"]
+            stream_ts = job["stream_ts"]
+            fps = job["fps"]
+
+            tic = time.time()
+            results, tracking_results, meta = self.engine.run_chunk(frames, fps=fps)
+            infer_time = time.time() - tic
+            end_to_end_latency = time.time() - stream_ts[-1]
+            processed_fps = (meta["n_frames"] / infer_time) if infer_time > 0 else 0.0
+
+            logger.info(
+                "chunk={} frames=[{}..{}] subjects={} infer={:.2f}s chunk_fps={:.2f} stream_latency={:.2f}s"
+                .format(
+                    chunk_id,
+                    frame_indices[0],
+                    frame_indices[-1],
+                    meta["n_subjects"],
+                    infer_time,
+                    processed_fps,
+                    end_to_end_latency,
+                )
+            )
+
+            overlay_bgr = None
+            overlay_text = None
+            if self.preview_enabled:
+                if self._renderer is None:
+                    from lib.vis.renderer import Renderer
+
+                    focal_length = (meta["width"] ** 2 + meta["height"] ** 2) ** 0.5
+                    self._renderer = Renderer(
+                        meta["width"],
+                        meta["height"],
+                        focal_length,
+                        self.cfg.DEVICE,
+                        self.engine.network.smpl.faces,
+                    )
+
+                rgb = frames[-1][..., ::-1].copy()
+                newest_local_idx = len(frames) - 1
+                for _, val in results.items():
+                    frame_ids = val.get("frame_id", [])
+                    verts_cam = val.get("verts_cam", [])
+                    hits = np.where(frame_ids == newest_local_idx)[0]
+                    if len(hits) == 0:
+                        continue
+                    i = hits[-1]
+                    if i >= len(verts_cam):
+                        continue
+                    mesh_verts = torch.from_numpy(verts_cam[i]).float().to(self.cfg.DEVICE)
+                    rgb = self._renderer.render_mesh(mesh_verts, rgb)
+
+                overlay_bgr = np.clip(rgb, 0, 255).astype(np.uint8)[..., ::-1]
+                overlay_text = (
+                    f"mesh | chunk {chunk_id} | subj {meta['n_subjects']} | "
+                    f"infer {infer_time:.2f}s | lag {end_to_end_latency:.2f}s"
+                )
+
+            if self.save_results:
+                out_file = osp.join(self.output_dir, f"wham_chunk_{chunk_id:06d}.pth")
+                payload = {
+                    "meta": {
+                        **meta,
+                        "chunk_id": chunk_id,
+                        "frame_start": frame_indices[0],
+                        "frame_end": frame_indices[-1],
+                        "infer_time_s": infer_time,
+                        "processed_fps": processed_fps,
+                        "stream_latency_s": end_to_end_latency,
+                    },
+                    "results": results,
+                    "tracking_results": tracking_results,
+                }
+                joblib.dump(payload, out_file)
+
+            with self._out_lock:
+                self._latest_overlay = overlay_bgr
+                self._latest_text = overlay_text
+                self._latest_chunk_id = chunk_id
+
+
 def build_cfg():
     cfg = get_cfg_defaults()
     cfg.merge_from_file("configs/yamls/demo.yaml")
@@ -303,9 +439,15 @@ def parse_args():
     parser.add_argument(
         "--input_mode",
         type=str,
-        default="udp",
         choices=["udp", "webcam"],
-        help="Input source type: udp stream or direct webcam device",
+        default="udp",
+        help="Input source mode: udp stream URL or webcam device index",
+    )
+    parser.add_argument(
+        "--webcam_index",
+        type=int,
+        default=0,
+        help="OpenCV webcam device index when --input_mode webcam",
     )
     parser.add_argument(
         "--stream_url",
@@ -314,10 +456,29 @@ def parse_args():
         help="OpenCV-compatible UDP input URL",
     )
     parser.add_argument(
-        "--webcam_index",
+        "--vitpose_variant",
+        type=str,
+        choices=["h", "b", "l", "s"],
+        default="h",
+        help="ViTPose model variant: h=huge, b=base, l=large, s=small",
+    )
+    parser.add_argument(
+        "--vitpose_ckpt",
+        type=str,
+        default=None,
+        help="Optional path to ViTPose checkpoint. If omitted, defaults to checkpoints/vitpose-<variant>-multi-coco.pth",
+    )
+    parser.add_argument(
+        "--min_track_frames",
         type=int,
-        default=0,
-        help="Webcam device index when --input_mode webcam",
+        default=8,
+        help="Minimum per-subject tracked frames to keep after detector postprocess",
+    )
+    parser.add_argument(
+        "--min_valid_joints",
+        type=int,
+        default=6,
+        help="Minimum visible joints required to accept a pose detection",
     )
     parser.add_argument("--output_dir", type=str, default="output/webcam", help="Output folder")
     parser.add_argument("--chunk_size", type=int, default=64, help="Frames per WHAM inference chunk")
@@ -329,12 +490,6 @@ def parse_args():
         help="Maximum buffered frames before dropping old frames",
     )
     parser.add_argument(
-        "--queue_timeout",
-        type=float,
-        default=5.0,
-        help="Seconds to wait for new frames in streaming loop",
-    )
-    parser.add_argument(
         "--save_results",
         action="store_true",
         help="Save per-chunk WHAM outputs as joblib files",
@@ -344,11 +499,6 @@ def parse_args():
         type=int,
         default=0,
         help="Stop after this many chunks. 0 means run forever.",
-    )
-    parser.add_argument(
-        "--keep_temp_videos",
-        action="store_true",
-        help="Keep temporary chunk videos for debugging",
     )
     parser.add_argument(
         "--preview",
@@ -376,13 +526,13 @@ def parse_args():
         "--process_oldest",
         dest="latest_only",
         action="store_false",
-        help="Process buffered windows in FIFO order (can increase lag)",
+        help="Process chunks in FIFO order (can increase lag)",
     )
     parser.add_argument(
-        "--infer_stride",
+        "--inference_stride",
         type=int,
-        default=2,
-        help="Submit one inference task every N incoming frames",
+        default=4,
+        help="Submit one inference job every N captured frames",
     )
     parser.set_defaults(latest_only=True)
     parser.set_defaults(preview=True)
@@ -392,8 +542,6 @@ def parse_args():
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
-    temp_dir = osp.join(args.output_dir, "temp")
-    os.makedirs(temp_dir, exist_ok=True)
 
     cfg = None
     engine = None
@@ -404,7 +552,13 @@ def main():
         if torch.cuda.is_available() and cfg.DEVICE.lower().startswith("cuda"):
             logger.info(f"GPU name -> {torch.cuda.get_device_name()}")
 
-        engine = RealtimeWham(cfg)
+        engine = RealtimeWham(
+            cfg,
+            vitpose_variant=args.vitpose_variant,
+            vitpose_ckpt=args.vitpose_ckpt,
+            min_track_frames=args.min_track_frames,
+            min_valid_joints=args.min_valid_joints,
+        )
     else:
         logger.info("Running in frames-only mode: model loading and predictions are disabled")
     grabber = UdpFrameGrabber(
@@ -426,134 +580,37 @@ def main():
     except queue.Full:
         # If the queue is full, dropping one warmup frame is acceptable.
         pass
-    logger.info("First frame received. Starting streaming loop.")
+    logger.info("First frame received. Starting WHAM processing loop.")
 
-    preview_window_live = "WHAM Live Input"
-    preview_window_mesh = "WHAM Mesh Latest"
-
+    renderer = None
     preview_enabled = args.preview
+    preview_window = "WHAM Realtime Preview"
     if preview_enabled and (not args.frames_only):
         try:
             from lib.vis.renderer import Renderer
         except Exception as exc:
-            logger.warning(f"Mesh preview disabled: failed to import renderer ({exc})")
+            logger.warning(f"Preview disabled: failed to import renderer ({exc})")
             preview_enabled = False
-            Renderer = None
-    else:
-        Renderer = None
 
-    submit_chunk_id = 0
-    completed_chunks = 0
-    frame_counter = 0
-    rolling_buffer = deque(maxlen=max(2, args.chunk_size))
-    rolling_buffer.append(first_item)
+    chunk_id = 0
     t0 = time.time()
     stop_requested = False
+    rolling = deque(maxlen=args.chunk_size)
+    capture_counter = 0
+    last_rendered_chunk_id = -1
+    last_qskip_total = 0
 
-    latest_mesh_preview = None
-    latest_mesh_stats = None
+    processor = None
+    if (not args.frames_only) and engine is not None:
+        processor = AsyncLatestProcessor(
+            engine=engine,
+            cfg=cfg,
+            preview_enabled=preview_enabled,
+            save_results=args.save_results,
+            output_dir=args.output_dir,
+        )
 
-    infer_queue = queue.Queue(maxsize=1)
-    infer_results_queue = queue.Queue(maxsize=1)
-    worker_stop_event = threading.Event()
-
-    def put_latest(q_obj, value):
-        try:
-            q_obj.put_nowait(value)
-            return
-        except queue.Full:
-            pass
-
-        try:
-            q_obj.get_nowait()
-        except queue.Empty:
-            pass
-
-        try:
-            q_obj.put_nowait(value)
-        except queue.Full:
-            pass
-
-    def inference_worker():
-        renderer = None
-        while not worker_stop_event.is_set():
-            try:
-                task = infer_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-
-            if task is None:
-                break
-
-            task_chunk_id, chunk_items = task
-            frame_indices = [x[0] for x in chunk_items]
-            frames = [x[1] for x in chunk_items]
-            stream_ts = [x[2] for x in chunk_items]
-            chunk_video_path = osp.join(temp_dir, f"chunk_{task_chunk_id:06d}.mp4")
-
-            tic = time.time()
-            results, tracking_results, meta = engine.run_chunk(frames, chunk_video_path, fps=args.fps)
-            infer_time = time.time() - tic
-            end_to_end_latency = time.time() - stream_ts[-1]
-            processed_fps = (meta["n_frames"] / infer_time) if infer_time > 0 else 0.0
-
-            preview_bgr = None
-            if preview_enabled and Renderer is not None:
-                try:
-                    if renderer is None:
-                        focal_length = (meta["width"] ** 2 + meta["height"] ** 2) ** 0.5
-                        renderer = Renderer(
-                            meta["width"],
-                            meta["height"],
-                            focal_length,
-                            cfg.DEVICE,
-                            engine.network.smpl.faces,
-                        )
-
-                    # Render only the newest frame in the window to reduce preview lag.
-                    local_last_idx = len(frames) - 1
-                    rgb = frames[local_last_idx][..., ::-1].copy()
-                    for _, val in results.items():
-                        frame_ids = np.asarray(val.get("frame_id", []))
-                        verts_cam = val.get("verts_cam", [])
-                        if frame_ids.size == 0:
-                            continue
-                        match = np.where(frame_ids == local_last_idx)[0]
-                        if len(match) == 0:
-                            continue
-                        mesh_idx = int(match[-1])
-                        if mesh_idx >= len(verts_cam):
-                            continue
-                        mesh_verts = torch.from_numpy(verts_cam[mesh_idx]).float().to(cfg.DEVICE)
-                        rgb = renderer.render_mesh(mesh_verts, rgb)
-
-                    preview_bgr = np.clip(rgb, 0, 255).astype(np.uint8)[..., ::-1]
-                except Exception as exc:
-                    logger.warning(f"Mesh render failed for chunk {task_chunk_id}: {exc}")
-
-            payload = {
-                "chunk_id": task_chunk_id,
-                "frame_start": frame_indices[0],
-                "frame_end": frame_indices[-1],
-                "results": results,
-                "tracking_results": tracking_results,
-                "meta": meta,
-                "infer_time": infer_time,
-                "processed_fps": processed_fps,
-                "stream_latency": end_to_end_latency,
-                "preview_bgr": preview_bgr,
-            }
-            put_latest(infer_results_queue, payload)
-
-            if (not args.keep_temp_videos) and osp.exists(chunk_video_path):
-                os.remove(chunk_video_path)
-
-    worker_thread = None
-    if not args.frames_only:
-        worker_thread = threading.Thread(target=inference_worker, daemon=True)
-        worker_thread.start()
-
-    def show_preview_frame(frame_bgr, window_name, overlay_text=None):
+    def show_preview_frame(frame_bgr, overlay_text=None):
         nonlocal stop_requested
         if not args.preview:
             return
@@ -570,137 +627,85 @@ def main():
                 2,
                 cv2.LINE_AA,
             )
-        cv2.imshow(window_name, disp)
+        cv2.imshow(preview_window, disp)
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             logger.info("Preview requested stop (q pressed)")
             stop_requested = True
 
+    def on_chunk_item(item):
+        # Show live raw frames during chunk collection for smoother preview.
+        _, frame, _ = item
+        if args.frames_only:
+            text = "frames-only | collecting"
+        else:
+            text = "collecting frames"
+        show_preview_frame(frame, text)
+
     try:
         while True:
             if stop_requested:
                 break
-            if args.max_chunks > 0 and completed_chunks >= args.max_chunks:
+            if args.max_chunks > 0 and chunk_id >= args.max_chunks:
                 break
 
-            try:
-                item = grabber.queue.get(timeout=args.queue_timeout)
-            except queue.Empty:
+            item = grabber.pop_latest(timeout_s=0.5)
+            if item is None:
                 continue
 
-            rolling_buffer.append(item)
-            frame_counter += 1
-            _, live_frame, _ = item
-
-            # Consume newest worker result.
-            if not args.frames_only:
-                while True:
-                    try:
-                        worker_result = infer_results_queue.get_nowait()
-                    except queue.Empty:
-                        break
-
-                    latest_mesh_preview = worker_result.get("preview_bgr")
-                    latest_mesh_stats = worker_result
-                    completed_chunks += 1
-
-                    logger.info(
-                        "chunk={} frames=[{}..{}] subjects={} infer={:.2f}s chunk_fps={:.2f} stream_latency={:.2f}s queue_drop={} latest_skip={}"
-                        .format(
-                            worker_result["chunk_id"],
-                            worker_result["frame_start"],
-                            worker_result["frame_end"],
-                            worker_result["meta"]["n_subjects"],
-                            worker_result["infer_time"],
-                            worker_result["processed_fps"],
-                            worker_result["stream_latency"],
-                            grabber.frames_dropped,
-                            grabber.frames_skipped_latest,
-                        )
-                    )
-
-                    if args.save_results:
-                        out_file = osp.join(args.output_dir, f"wham_chunk_{worker_result['chunk_id']:06d}.pth")
-                        joblib.dump(
-                            {
-                                "meta": {
-                                    **worker_result["meta"],
-                                    "chunk_id": worker_result["chunk_id"],
-                                    "frame_start": worker_result["frame_start"],
-                                    "frame_end": worker_result["frame_end"],
-                                    "infer_time_s": worker_result["infer_time"],
-                                    "processed_fps": worker_result["processed_fps"],
-                                    "stream_latency_s": worker_result["stream_latency"],
-                                },
-                                "results": worker_result["results"],
-                                "tracking_results": worker_result["tracking_results"],
-                            },
-                            out_file,
-                        )
+            frame_idx, frame, frame_ts = item
+            rolling.append((frame_idx, frame, frame_ts))
+            capture_counter += 1
 
             if args.frames_only:
                 if args.preview:
                     show_preview_frame(
-                        live_frame,
-                        preview_window_live,
-                        f"frames-only | frame {item[0]} | drop {grabber.frames_dropped}",
+                        frame,
+                        f"frames-only | frame {frame_idx} | qdrop {grabber.frames_dropped} | qskip {grabber.frames_skipped_latest}",
                     )
-
-                logger.info(
-                    "frames-only frame={} queue_drop={} latest_skip={}"
-                    .format(
-                        item[0],
-                        grabber.frames_dropped,
-                        grabber.frames_skipped_latest,
-                    )
-                )
                 continue
 
-            # Show live input continuously regardless of inference state.
-            if args.preview:
-                pending = infer_queue.qsize()
-                show_preview_frame(
-                    live_frame,
-                    preview_window_live,
-                    f"live frame {item[0]} | buffer {len(rolling_buffer)}/{rolling_buffer.maxlen} | pending {pending}",
+            if len(rolling) >= args.chunk_size and (capture_counter % max(1, args.inference_stride) == 0):
+                window = list(rolling)
+                if args.latest_only and len(window) > args.chunk_size:
+                    window = window[-args.chunk_size:]
+
+                frame_indices = [x[0] for x in window]
+                frames = [x[1] for x in window]
+                stream_ts = [x[2] for x in window]
+
+                processor.submit(
+                    chunk_id=chunk_id,
+                    frames=frames,
+                    frame_indices=frame_indices,
+                    stream_ts=stream_ts,
+                    fps=args.fps,
                 )
+                chunk_id += 1
 
-                if latest_mesh_preview is not None:
-                    stat_text = "mesh latest"
-                    if latest_mesh_stats is not None:
-                        stat_text = (
-                            f"mesh chunk {latest_mesh_stats['chunk_id']} | subj {latest_mesh_stats['meta']['n_subjects']}"
-                            f" | infer {latest_mesh_stats['infer_time']:.2f}s"
-                        )
-                    show_preview_frame(latest_mesh_preview, preview_window_mesh, stat_text)
-
-            # Submit rolling buffer snapshot to worker.
-            stride = max(1, args.infer_stride)
-            if len(rolling_buffer) >= rolling_buffer.maxlen and (frame_counter % stride == 0):
-                snapshot = list(rolling_buffer)
-
-                # Optionally submit newest slice if we have extra backlog.
-                if args.latest_only and len(snapshot) > args.chunk_size:
-                    snapshot = snapshot[-args.chunk_size:]
-
-                put_latest(infer_queue, (submit_chunk_id, snapshot))
-                submit_chunk_id += 1
+            if args.preview:
+                overlay, overlay_text, overlay_chunk_id = processor.get_latest_overlay()
+                if overlay is not None and overlay_chunk_id != last_rendered_chunk_id:
+                    show_preview_frame(overlay, overlay_text)
+                    last_rendered_chunk_id = overlay_chunk_id
+                else:
+                    qskip_delta = grabber.frames_skipped_latest - last_qskip_total
+                    last_qskip_total = grabber.frames_skipped_latest
+                    show_preview_frame(
+                        frame,
+                        f"live | frame {frame_idx} | rolling {len(rolling)}/{args.chunk_size} | qdrop {grabber.frames_dropped} | qskip+{qskip_delta} (total {grabber.frames_skipped_latest})",
+                    )
 
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
     finally:
-        worker_stop_event.set()
-        if not args.frames_only:
-            put_latest(infer_queue, None)
-            if worker_thread is not None:
-                worker_thread.join(timeout=2.0)
+        if processor is not None:
+            processor.stop()
         grabber.stop()
         if args.preview:
             cv2.destroyAllWindows()
         elapsed = time.time() - t0
-        logger.info(
-            f"Finished. submitted_chunks={submit_chunk_id}, completed_chunks={completed_chunks}, elapsed={elapsed:.2f}s"
-        )
+        logger.info(f"Finished. chunks={chunk_id}, elapsed={elapsed:.2f}s")
 
 
 if __name__ == "__main__":

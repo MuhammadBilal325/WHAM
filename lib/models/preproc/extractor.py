@@ -29,15 +29,34 @@ class FeatureExtractor(object):
         self.model = hmr2(ckpt).to(device).eval()
     
     def run(self, video, tracking_results, patch_h=256, patch_w=256):
-        
-        if osp.isfile(video):
-            cap = cv2.VideoCapture(video)
+        """
+        Accept one of:
+        - video file path
+        - list of image paths
+        - list/tuple of in-memory BGR frames (np.ndarray)
+        - 4D numpy array (T, H, W, C)
+        """
+
+        is_video = False
+        is_memory_frames = False
+
+        if isinstance(video, np.ndarray) and video.ndim == 4:
+            cap = list(video)
+            is_memory_frames = True
+            length = len(cap)
+            height, width = cap[0].shape[:2]
+        elif isinstance(video, (list, tuple)) and len(video) > 0 and isinstance(video[0], np.ndarray):
+            cap = video
+            is_memory_frames = True
+            length = len(cap)
+            height, width = cap[0].shape[:2]
+        elif isinstance(video, (str, os.PathLike)) and osp.isfile(video):
+            cap = cv2.VideoCapture(str(video))
             is_video = True
             length = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             width, height = cap.get(cv2.CAP_PROP_FRAME_WIDTH), cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-        else:   # Image list
+        else:   # Image path list
             cap = video
-            is_video = False
             length = len(video)
             height, width = cv2.imread(video[0]).shape[:2]
         
@@ -48,6 +67,10 @@ class FeatureExtractor(object):
                 flag, img = cap.read()
                 if not flag:
                     break
+            elif is_memory_frames:
+                if frame_id >= len(cap):
+                    break
+                img = cap[frame_id]
             else:
                 if frame_id >= len(cap):
                     break

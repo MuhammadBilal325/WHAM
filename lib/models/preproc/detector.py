@@ -28,11 +28,33 @@ MINIMUM_FRMAES = 30
 MINIMUM_JOINTS = 6
 
 class DetectionModel(object):
-    def __init__(self, device):
+    def __init__(self, device, vitpose_variant='h', vitpose_ckpt=None, minimum_frames=MINIMUM_FRMAES, minimum_joints=MINIMUM_JOINTS):
+
+        variant_to_cfg = {
+            'h': 'ViTPose_huge_coco_256x192.py',
+            'b': 'ViTPose_base_coco_256x192.py',
+            'l': 'ViTPose_large_coco_256x192.py',
+            's': 'ViTPose_small_coco_256x192.py',
+        }
+        if vitpose_variant not in variant_to_cfg:
+            raise ValueError(f'Unsupported ViTPose variant: {vitpose_variant}')
         
         # ViTPose
-        pose_model_cfg = osp.join(VIT_DIR, 'configs/body/2d_kpt_sview_rgb_img/topdown_heatmap/coco/ViTPose_huge_coco_256x192.py')
-        pose_model_ckpt = osp.join(ROOT_DIR, 'checkpoints', 'vitpose-h-multi-coco.pth')
+        pose_model_cfg = osp.join(
+            VIT_DIR,
+            'configs/body/2d_kpt_sview_rgb_img/topdown_heatmap/coco',
+            variant_to_cfg[vitpose_variant]
+        )
+        if vitpose_ckpt is None:
+            pose_model_ckpt = osp.join(ROOT_DIR, 'checkpoints', f'vitpose-{vitpose_variant}-multi-coco.pth')
+        else:
+            pose_model_ckpt = vitpose_ckpt
+
+        if not osp.isfile(pose_model_ckpt):
+            raise FileNotFoundError(
+                f'ViTPose checkpoint not found: {pose_model_ckpt}. '
+                f'Provide --vitpose_ckpt or place the checkpoint at this path.'
+            )
         self.pose_model = init_pose_model(pose_model_cfg, pose_model_ckpt, device=device.lower())
         
         # YOLO
@@ -40,6 +62,8 @@ class DetectionModel(object):
         self.bbox_model = YOLO(bbox_model_ckpt)
         
         self.device = device
+        self.minimum_frames = int(minimum_frames)
+        self.minimum_joints = int(minimum_joints)
         self.initialize_tracking()
         
     def initialize_tracking(self, ):
@@ -105,7 +129,7 @@ class DetectionModel(object):
         
         for pose_result in pose_results:
             n_valid = (pose_result['keypoints'][:, -1] > VIS_THRESH).sum()
-            if n_valid < MINIMUM_JOINTS: continue
+            if n_valid < self.minimum_joints: continue
             
             _id = pose_result['track_id']
             xyxy = pose_result['bbox']
@@ -135,7 +159,7 @@ class DetectionModel(object):
         # Smooth bounding box detection
         ids = list(output.keys())
         for _id in ids:
-            if len(output[_id]['bbox']) < MINIMUM_FRMAES:
+            if len(output[_id]['bbox']) < self.minimum_frames:
                 del output[_id]
                 continue
             
