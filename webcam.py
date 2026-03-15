@@ -296,6 +296,9 @@ class AsyncLatestProcessor:
         self._latest_overlay = None
         self._latest_text = None
         self._latest_chunk_id = -1
+        self._latest_clip = None
+        self._latest_clip_text = None
+        self._latest_clip_chunk_id = -1
 
         self._renderer = None
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -318,6 +321,18 @@ class AsyncLatestProcessor:
             if self._latest_overlay is None:
                 return None, None, -1
             return self._latest_overlay.copy(), self._latest_text, self._latest_chunk_id
+
+    def pop_latest_clip(self):
+        with self._out_lock:
+            if self._latest_clip is None:
+                return None, None, -1
+            clip = self._latest_clip
+            text = self._latest_clip_text
+            chunk_id = self._latest_clip_chunk_id
+            self._latest_clip = None
+            self._latest_clip_text = None
+            self._latest_clip_chunk_id = -1
+            return clip, text, chunk_id
 
     def stop(self):
         self._stop_event.set()
@@ -367,6 +382,8 @@ class AsyncLatestProcessor:
 
             overlay_bgr = None
             overlay_text = None
+            rendered_clip = None
+            clip_text = None
             if self.preview_enabled:
                 if self._renderer is None:
                     from lib.vis.renderer import Renderer
@@ -380,25 +397,23 @@ class AsyncLatestProcessor:
                         self.engine.network.smpl.faces,
                     )
 
-                rgb = frames[-1][..., ::-1].copy()
-                newest_local_idx = len(frames) - 1
+                rgb_frames = [f[..., ::-1].copy() for f in frames]
                 for _, val in results.items():
                     frame_ids = val.get("frame_id", [])
                     verts_cam = val.get("verts_cam", [])
-                    hits = np.where(frame_ids == newest_local_idx)[0]
-                    if len(hits) == 0:
-                        continue
-                    i = hits[-1]
-                    if i >= len(verts_cam):
-                        continue
-                    mesh_verts = torch.from_numpy(verts_cam[i]).float().to(self.cfg.DEVICE)
-                    rgb = self._renderer.render_mesh(mesh_verts, rgb)
+                    for i, fid in enumerate(frame_ids):
+                        if fid < 0 or fid >= len(rgb_frames) or i >= len(verts_cam):
+                            continue
+                        mesh_verts = torch.from_numpy(verts_cam[i]).float().to(self.cfg.DEVICE)
+                        rgb_frames[fid] = self._renderer.render_mesh(mesh_verts, rgb_frames[fid])
 
-                overlay_bgr = np.clip(rgb, 0, 255).astype(np.uint8)[..., ::-1]
+                rendered_clip = [np.clip(x, 0, 255).astype(np.uint8)[..., ::-1] for x in rgb_frames]
+                overlay_bgr = rendered_clip[-1]
                 overlay_text = (
                     f"mesh | chunk {chunk_id} | subj {meta['n_subjects']} | "
                     f"infer {infer_time:.2f}s | lag {end_to_end_latency:.2f}s"
                 )
+                clip_text = overlay_text
 
             if self.save_results:
                 out_file = osp.join(self.output_dir, f"wham_chunk_{chunk_id:06d}.pth")
@@ -421,6 +436,9 @@ class AsyncLatestProcessor:
                 self._latest_overlay = overlay_bgr
                 self._latest_text = overlay_text
                 self._latest_chunk_id = chunk_id
+                self._latest_clip = rendered_clip
+                self._latest_clip_text = clip_text
+                self._latest_clip_chunk_id = chunk_id
 
 
 def build_cfg():
@@ -513,6 +531,19 @@ def parse_args():
         help="Disable preview window",
     )
     parser.add_argument(
+        "--preview_mode",
+        type=str,
+        choices=["live", "synced"],
+        default="live",
+        help="live: raw/live preview with latest mesh overlay, synced: play full inferred mesh clip",
+    )
+    parser.add_argument(
+        "--playback_fps",
+        type=float,
+        default=30.0,
+        help="Playback FPS used when --preview_mode synced",
+    )
+    parser.add_argument(
         "--frames_only",
         action="store_true",
         help="Do not load any models; only display incoming frames",
@@ -582,15 +613,8 @@ def main():
         pass
     logger.info("First frame received. Starting WHAM processing loop.")
 
-    renderer = None
     preview_enabled = args.preview
     preview_window = "WHAM Realtime Preview"
-    if preview_enabled and (not args.frames_only):
-        try:
-            from lib.vis.renderer import Renderer
-        except Exception as exc:
-            logger.warning(f"Preview disabled: failed to import renderer ({exc})")
-            preview_enabled = False
 
     chunk_id = 0
     t0 = time.time()
@@ -610,7 +634,7 @@ def main():
             output_dir=args.output_dir,
         )
 
-    def show_preview_frame(frame_bgr, overlay_text=None):
+    def show_preview_frame(frame_bgr, overlay_text=None, wait_ms=1):
         nonlocal stop_requested
         if not args.preview:
             return
@@ -628,19 +652,10 @@ def main():
                 cv2.LINE_AA,
             )
         cv2.imshow(preview_window, disp)
-        key = cv2.waitKey(1) & 0xFF
+        key = cv2.waitKey(wait_ms) & 0xFF
         if key == ord("q"):
             logger.info("Preview requested stop (q pressed)")
             stop_requested = True
-
-    def on_chunk_item(item):
-        # Show live raw frames during chunk collection for smoother preview.
-        _, frame, _ = item
-        if args.frames_only:
-            text = "frames-only | collecting"
-        else:
-            text = "collecting frames"
-        show_preview_frame(frame, text)
 
     try:
         while True:
@@ -684,17 +699,36 @@ def main():
                 chunk_id += 1
 
             if args.preview:
-                overlay, overlay_text, overlay_chunk_id = processor.get_latest_overlay()
-                if overlay is not None and overlay_chunk_id != last_rendered_chunk_id:
-                    show_preview_frame(overlay, overlay_text)
-                    last_rendered_chunk_id = overlay_chunk_id
+                if args.preview_mode == "synced":
+                    clip, clip_text, clip_chunk_id = processor.pop_latest_clip()
+                    if clip is not None and clip_chunk_id != last_rendered_chunk_id:
+                        playback_wait = max(1, int(1000.0 / max(1.0, args.playback_fps)))
+                        for i, clip_frame in enumerate(clip):
+                            show_preview_frame(
+                                clip_frame,
+                                f"{clip_text} | play {i+1}/{len(clip)}",
+                                wait_ms=playback_wait,
+                            )
+                            if stop_requested:
+                                break
+                        last_rendered_chunk_id = clip_chunk_id
+                    else:
+                        # Keep window responsive while waiting for next inferred clip.
+                        if cv2.waitKey(1) & 0xFF == ord("q"):
+                            logger.info("Preview requested stop (q pressed)")
+                            stop_requested = True
                 else:
-                    qskip_delta = grabber.frames_skipped_latest - last_qskip_total
-                    last_qskip_total = grabber.frames_skipped_latest
-                    show_preview_frame(
-                        frame,
-                        f"live | frame {frame_idx} | rolling {len(rolling)}/{args.chunk_size} | qdrop {grabber.frames_dropped} | qskip+{qskip_delta} (total {grabber.frames_skipped_latest})",
-                    )
+                    overlay, overlay_text, overlay_chunk_id = processor.get_latest_overlay()
+                    if overlay is not None and overlay_chunk_id != last_rendered_chunk_id:
+                        show_preview_frame(overlay, overlay_text)
+                        last_rendered_chunk_id = overlay_chunk_id
+                    else:
+                        qskip_delta = grabber.frames_skipped_latest - last_qskip_total
+                        last_qskip_total = grabber.frames_skipped_latest
+                        show_preview_frame(
+                            frame,
+                            f"live | frame {frame_idx} | rolling {len(rolling)}/{args.chunk_size} | qdrop {grabber.frames_dropped} | qskip+{qskip_delta} (total {grabber.frames_skipped_latest})",
+                        )
 
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
