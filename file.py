@@ -140,26 +140,33 @@ def get_neutral_smpl_init(smpl, device):
         init_smpl: (1, 1, 24*6) initial SMPL parameters in rotation-6d
         init_root: (1, 1, 6) initial root orientation in rotation-6d
     """
+    # SMPL expects global_orient (B, 1, 3, 3) and body_pose (B, 23, 3, 3)
     init_global_orient = torch.eye(3, device=device).unsqueeze(0).unsqueeze(0)  # (1, 1, 3, 3)
-    init_body_pose = torch.eye(3, device=device).unsqueeze(0).unsqueeze(0).repeat(1, 1, 23, 1, 1)
-    init_betas = torch.zeros(1, 1, 10, device=device)
+    init_body_pose = torch.eye(3, device=device).unsqueeze(0).repeat(1, 23, 1, 1)  # (1, 23, 3, 3)
+    init_betas = torch.zeros(1, 10, device=device)  # (1, 10)
 
     init_output = smpl.get_output(
-        global_orient=init_global_orient.squeeze(0),
-        body_pose=init_body_pose.squeeze(0),
-        betas=init_betas.squeeze(0),
+        global_orient=init_global_orient,
+        body_pose=init_body_pose,
+        betas=init_betas,
         pose2rot=False,
         return_full_pose=True
     )
 
-    init_kp3d = root_centering(init_output.joints[:1, :17], 'coco')
+    # init_output.joints is (1, 17, 3)
+    # init_kp for motion encoder: [root_centered_3d_kps (17*3), norm_2d_kps_with_location_scale (17*2+3)]
+    # Total: 51 + 37 = 88, matching WHAM's expected input dimension
+    init_kp3d = root_centering(init_output.joints[:, :17], 'coco')  # (1, 17, 3)
     init_kp = torch.cat([
-        init_kp3d.reshape(1, 1, -1),
-        torch.zeros(1, 1, 17 * 2, device=device)  # placeholder for 2D keypoints
-    ], dim=-1)
+        init_kp3d.reshape(1, 1, -1),  # (1, 1, 17*3 = 51)
+        torch.zeros(1, 1, 17 * 2 + 3, device=device)  # placeholder for norm 2D kps + location/scale
+    ], dim=-1)  # (1, 1, 88)
 
-    init_smpl = matrix_to_rotation_6d(init_output.full_pose).unsqueeze(0)
-    init_root = matrix_to_rotation_6d(init_output.global_orient).unsqueeze(0)
+    # full_pose is (1, 24, 3, 3) -> rotation-6d -> (1, 24*6)
+    # But motion_decoder expects (B, 1, 24*6), so add dim
+    init_smpl = matrix_to_rotation_6d(init_output.full_pose).unsqueeze(1)  # (1, 1, 24*6)
+    # global_orient is (1, 1, 3, 3) -> rotation-6d -> (1, 1, 6) which is correct for trajectory_decoder
+    init_root = matrix_to_rotation_6d(init_output.global_orient)  # (1, 1, 6)
 
     return init_kp, init_smpl, init_root
 
@@ -350,6 +357,8 @@ class CameraSpaceLifter:
         res = torch.tensor([image_width, image_height]).float()
         intrinsics = compute_cam_intrinsics(res).to(self.device)
         self._intrinsics_cache[(image_width, image_height)] = intrinsics
+        # Set image size on buffer so push_frame can use it
+        self.buffer.image_size = (image_width, image_height)
         print(f"Stream started: {image_width}x{image_height}")
 
     def push_frame(self, kp2d, confidence=None):
@@ -379,8 +388,8 @@ class CameraSpaceLifter:
 
         image_width, image_height = self.buffer.image_size
 
-        # Create mask for low-confidence keypoints
-        mask = torch.from_numpy(confidence < 0.3).float()  # (17,)
+        # Create mask for low-confidence keypoints (must be bool for indexing)
+        mask = torch.from_numpy(confidence < 0.3).bool()  # (17,)
 
         # Normalize keypoints
         norm_kp2d, bbox = self.normalize_keypoints(kp2d, image_width, image_height)
@@ -409,9 +418,9 @@ class CameraSpaceLifter:
         x, mask_input, bbox, img_w, img_h = self.buffer.get_window_tensors(self.device)
         F = x.shape[1]
 
-        # Build init_kp: replace the placeholder 2D part with actual first frame's keypoints
+        # Build init_kp: replace the placeholder 2D part with first frame's full norm kps (includes location/scale)
         init_kp = self.init_kp_template.clone()
-        init_kp[:, :, 17 * 3:] = x[:, :1, :17 * 2]  # Use first frame's 2D keypoints
+        init_kp[:, :, 17 * 3:] = x[:, :1, :]  # Use first frame's full norm kps (17*2+3 = 37 dims)
 
         # Camera angular velocity (zero for camera-space, no SLAM)
         cam_angvel = torch.zeros(1, F, 6, device=self.device)
@@ -439,29 +448,39 @@ class CameraSpaceLifter:
             res=res,
         )
 
-        # Extract results for the LAST frame in the window
+        # Extract results for the LAST frame in the window.
+        # Network output shapes (B=1, F frames):
+        #   pred['verts_cam'] is (B*F, 6890, 3) - SMPL flattens B*F
+        #   pred['poses_body'] is (B*F, 23, 3, 3) - SMPL flattens B*F
+        #   pred['poses_root_cam'] is (B*F, 3, 3) - SMPL flattens B*F
+        #   pred['betas'] is (B, F, 10) = (1, F, 10) - NOT flattened
+        # Use [-1:] for SMPL-flattened outputs, [:, -1, :] for betas.
+        last_body = pred['poses_body'][-1:]  # (1, 23, 3, 3)
+        last_root = pred['poses_root_cam'][-1:]  # (1, 3, 3)
+        last_betas = pred['betas'][:, -1, :]  # (1, 10)
+        last_verts = pred['verts_cam'][-1:]  # (1, 6890, 3)
+
         results = {
-            'vertices': pred['verts_cam'][:, -1].cpu().numpy(),  # (1, 6890, 3)
-            'poses_body': pred['poses_body'][:, -1].cpu().numpy(),  # (1, 23, 6)
-            'betas': pred['betas'][:, -1].cpu().numpy(),  # (1, 10)
-            'poses_root_cam': pred['poses_root_cam'][:, -1].cpu().numpy(),  # (1, 6)
+            'vertices': last_verts.cpu().numpy(),  # (1, 6890, 3)
+            'poses_body': last_body.cpu().numpy(),  # (1, 23, 3, 3)
+            'betas': last_betas.cpu().numpy(),  # (1, 10)
+            'poses_root_cam': last_root.cpu().numpy(),  # (1, 3, 3)
         }
 
-        # Get 3D joints from SMPL
-        pred_pose_6d = pred['poses_body'][:, -1:]  # (1, 1, 23*6)
-        pred_root_6d = pred['poses_root_cam'][:, -1:]  # (1, 1, 6)
-
-        full_pose_6d = torch.cat([pred_root_6d, pred_pose_6d], dim=-1)  # (1, 1, 24*6)
-        full_pose_rotmat = rotation_6d_to_matrix(full_pose_6d.reshape(1, 1, 24, 6)).reshape(1, 24, 3, 3)
+        # Get 3D joints - re-run SMPL with the predicted pose
+        if last_root.dim() == 3:
+            last_root_smpl = last_root.unsqueeze(1)  # (1, 1, 3, 3) for SMPL
+        else:
+            last_root_smpl = last_root
 
         smpl_out = self.smpl.get_output(
-            global_orient=full_pose_rotmat[:, :1],
-            body_pose=full_pose_rotmat[:, 1:],
-            betas=pred['betas'][:, -1:],
+            global_orient=last_root_smpl,
+            body_pose=last_body,
+            betas=last_betas,
             pose2rot=False,
             return_full_pose=True
         )
-        results['joints_3d'] = smpl_out.joints.cpu().numpy()  # (1, 17, 3)
+        results['joints_3d'] = smpl_out.joints.cpu().numpy()  # (1, N_joints, 3)
 
         return results
 
@@ -482,7 +501,7 @@ class CameraSpaceLifter:
         if confidence is None:
             confidence = np.ones(17)
 
-        mask = torch.from_numpy(confidence < 0.3).float()
+        mask = torch.from_numpy(confidence < 0.3).bool()
         norm_kp2d, bbox = self.normalize_keypoints(kp2d, image_width, image_height)
 
         x = norm_kp2d.unsqueeze(0).unsqueeze(0).to(self.device)
@@ -509,28 +528,34 @@ class CameraSpaceLifter:
             res=res,
         )
 
+        # For single frame (F=1):
+        #   pred['verts_cam'] is (1, 6890, 3), pred['poses_body'] is (1, 23, 3, 3)
+        #   pred['poses_root_cam'] is (1, 3, 3), pred['betas'] is (1, 1, 10)
+        last_body = pred['poses_body'][-1:]  # (1, 23, 3, 3)
+        last_root = pred['poses_root_cam'][-1:]  # (1, 3, 3)
+        last_betas = pred['betas'][:, -1, :]  # (1, 10)
+
+        if last_root.dim() == 3:
+            last_root_smpl = last_root.unsqueeze(1)  # (1, 1, 3, 3) for SMPL
+        else:
+            last_root_smpl = last_root
+
         results = {
-            'vertices': pred['verts_cam'].cpu().squeeze(0).numpy(),
-            'poses_body': pred['poses_body'].cpu().squeeze(0).numpy(),
-            'betas': pred['betas'].cpu().squeeze(0).numpy(),
-            'poses_root_cam': pred['poses_root_cam'].cpu().squeeze(0).numpy(),
+            'vertices': pred['verts_cam'][-1:].cpu().numpy(),  # (1, 6890, 3)
+            'poses_body': last_body.cpu().numpy(),  # (1, 23, 3, 3)
+            'betas': last_betas.cpu().numpy(),  # (1, 10)
+            'poses_root_cam': last_root.cpu().numpy(),  # (1, 3, 3)
         }
 
-        # Get 3D joints
-        pred_pose_6d = pred['poses_body'].reshape(1, -1, 6) if pred['poses_body'].dim() == 2 else pred['poses_body']
-        pred_root_6d = pred['poses_root_cam'].reshape(1, -1, 6) if pred['poses_root_cam'].dim() == 2 else pred['poses_root_cam']
-
-        full_pose_6d = torch.cat([pred_root_6d, pred_pose_6d], dim=1)
-        full_pose_rotmat = rotation_6d_to_matrix(full_pose_6d.reshape(1, 1, 24, 6)).reshape(1, 24, 3, 3)
-
+        # Get 3D joints by re-running SMPL with the predicted pose
         smpl_out = self.smpl.get_output(
-            global_orient=full_pose_rotmat[:, :1],
-            body_pose=full_pose_rotmat[:, 1:],
-            betas=pred['betas'].reshape(1, -1) if pred['betas'].dim() == 1 else pred['betas'],
+            global_orient=last_root_smpl,
+            body_pose=last_body,
+            betas=last_betas,
             pose2rot=False,
             return_full_pose=True
         )
-        results['joints_3d'] = smpl_out.joints.cpu().squeeze(0).numpy()
+        results['joints_3d'] = smpl_out.joints.cpu().numpy()  # (1, N_joints, 3)
 
         return results
 
@@ -582,6 +607,8 @@ def main():
                         help='Sliding window size for temporal smoothing (default: 16)')
     parser.add_argument('--stride', '-s', type=int, default=1,
                         help='Stride for sliding window (default: 1)')
+    parser.add_argument('--ignore_confidence', action='store_true',
+                        help='Ignore the confidence values from datagrams and treat all keypoints as valid')
     args = parser.parse_args()
 
     # Check if file exists
@@ -612,7 +639,20 @@ def main():
 
     # Extract keypoints and confidence
     all_kp2d = np.stack([dg['pose_2d'] for dg in datagrams])
-    all_confidence = np.stack([dg.get('confidence_2d', np.ones(17)) for dg in datagrams])
+    
+    if args.ignore_confidence:
+        print("Ignoring confidence values as requested, treating all keypoints as valid.")
+        all_confidence = np.ones((len(datagrams), 17))
+    else:
+        all_confidence = np.stack([dg.get('confidence_2d', np.ones(17)) for dg in datagrams])
+        max_conf = all_confidence.max()
+        if max_conf < 0.3:
+            print(f"\n[WARNING] Maximum confidence value in data is {max_conf:.5f}, which is below the threshold of 0.3.")
+            print("This causes all keypoints to be masked/zeroed out, leading to a static predicted pose.")
+            print("Automatically ignoring the confidence mask and treating all keypoints as valid.")
+            print("To override this, check your exporter or pass valid confidence values.")
+            all_confidence = np.ones((len(datagrams), 17))
+
     image_width = datagrams[0]['image_width']
     image_height = datagrams[0]['image_height']
 
