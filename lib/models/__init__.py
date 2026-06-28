@@ -29,7 +29,7 @@ def build_network(cfg, smpl):
     
     # Load Checkpoint
     if os.path.isfile(cfg.TRAIN.CHECKPOINT):
-        checkpoint = torch.load(cfg.TRAIN.CHECKPOINT)
+        checkpoint = torch.load(cfg.TRAIN.CHECKPOINT, map_location='cpu')
         ignore_keys = ['smpl.body_pose', 'smpl.betas', 'smpl.global_orient', 'smpl.J_regressor_extra', 'smpl.J_regressor_eval']
         model_state_dict = {k: v for k, v in checkpoint['model'].items() if k not in ignore_keys}
         network.load_state_dict(model_state_dict, strict=False)

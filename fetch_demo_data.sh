@@ -157,7 +157,8 @@ extract_tar_if_needed () {
 	fi
 
 	while true; do
-		if tar -xf "$archive_path"; then
+		if tar -xvf "$archive_path" -C dataset/; then
+			rm -rf "$archive_path"
 			if [[ -e "$check_path" ]]; then
 				return 0
 			fi

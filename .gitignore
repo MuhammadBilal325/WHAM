@@ -5,3 +5,5 @@ examples/
 #Ignore all __pycache__ folders
 __pycache__/
 output/
+downloads/
+test_data/

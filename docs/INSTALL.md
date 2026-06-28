@@ -21,8 +21,8 @@ conda install -c nvidia cuda-nvcc=11.3 -y
 conda install -c fvcore -c iopath -c conda-forge fvcore iopath
 conda install -c conda-forge mkl=2024.0 -y
 
-pip install torch==1.11.0+cu113 torchvision==0.12.0+cu113 torchaudio==0.11.0+cu113 torch_scatter==2.0.9  -f https://download.pytorch.org/whl/torch/ -f https://download.pytorch.org/whl/torchaudio/ -f https://download.pytorch.org/whl/torchvision/ -f https://data.pyg.org/whl/torch-1.11.0%2Bcu113.html
-pip install pytorch3d -f https://dl.fbaipublicfiles.com/pytorch3d/packaging/wheels/py310_cu113_pyt1110/download.html
+pip install torch==2.0.1+cu117 torchvision==0.15.2+cu117 torchaudio==2.0.2+cu117 torch_scatter==2.0.9  -f https://download.pytorch.org/whl/torch/ -f https://download.pytorch.org/whl/torchaudio/ -f https://download.pytorch.org/whl/torchvision/ -f https://data.pyg.org/whl/torch-2.0.1%2Bcu117.html
+pip install pytorch3d -f https://dl.fbaipublicfiles.com/pytorch3d/packaging/wheels/py310_cu117_pyt201/download.html
 pip install numpy==1.22.3
 pip install "setuptools<81"
 pip list --format=freeze > constraints.txt
